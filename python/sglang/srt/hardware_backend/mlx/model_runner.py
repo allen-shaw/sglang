@@ -131,6 +131,7 @@ class MlxModelRunner:
         self._mem_fraction_static = mem_fraction_static
         # Counter used to trigger periodic mx.clear_cache() calls.
         self._decode_step_ct: int = 0
+        self._clear_steps = envs.SGLANG_MLX_CLEAR_CACHE_STEPS.get()
         # On-the-fly quantization preset (e.g. "mlx_q4"). None = no on-load quantization.
         # Pre-quantized HF repos load correctly regardless of this setting:
         # mlx_lm.load() detects the config and instantiates QuantizedLinear
@@ -511,9 +512,17 @@ class MlxModelRunner:
         if hasattr(sample_attn, "k_proj") and hasattr(sample_attn.k_proj, "weight"):
             dtype = sample_attn.k_proj.weight.dtype
         if dtype not in _MLX_KV_FLOAT_DTYPES:
-            # QuantizedLinear stores packed weights as integers, while the KV
-            # cache stores dequantized projection outputs.
-            dtype = mx.float32
+            # QuantizedLinear packs weights as integers, but the KV cache
+            # stores dequantized projection outputs, which are produced in
+            # the compute dtype carried by the quantization scales.  Storing
+            # at that dtype instead of float32 halves pool bytes per slot
+            # and keeps prefix-hit forwards in the same dtype as the no-hit
+            # path (a float32 pool promoted every post-hit concat).
+            scales = getattr(sample_attn.k_proj, "scales", None)
+            if scales is not None and scales.dtype in _MLX_KV_FLOAT_DTYPES:
+                dtype = scales.dtype
+            else:
+                dtype = mx.float32
         return n_kv_heads, head_dim, dtype
 
     def _get_attn_config(self) -> tuple[int, int, mx.Dtype]:
@@ -1197,10 +1206,6 @@ class MlxModelRunner:
         """
         caches = prev.caches
 
-        # TODO (changminbark): Need to fix
-        # ContiguousAttentionKVCache.write_token to accommodate dynamic growing
-        # like ContiguousAttentionKVCache.update_and_fetch.
-
         # After prev's graph ran, each attention KV cache offset was
         # bumped by one per layer - attention wrapper's `write_token`
         # mutates the Python offset synchronously at graph-build time.
@@ -1244,8 +1249,7 @@ class MlxModelRunner:
             self._req_token_ids[rid].append(next_tokens[i])
 
         self._decode_step_ct += 1
-        # TODO (changminbark): allow for flag configuration for clearing mx cache
-        if self._decode_step_ct % 256 == 0:
+        if self._clear_steps > 0 and self._decode_step_ct % self._clear_steps == 0:
             mx.clear_cache()
 
         return next_tokens

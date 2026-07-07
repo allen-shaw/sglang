@@ -1092,7 +1092,7 @@ class MoriKVManager(CommonKVManager):
                         dst_dims,
                     )
                 )
-            elif st in ("swa", "dsa"):
+            elif st in ("swa", "dsa", "swa_ring", "c128_state", "minimax_index_k"):
                 statuses.extend(
                     self._send_swa_dsa_state(
                         peer_info,
@@ -1219,13 +1219,37 @@ class MoriKVManager(CommonKVManager):
                 f"PD state transfer does not support TP-mismatched non-MLA SWA models "
                 f"(prefill_tp_size={self.attn_tp_size}, decode_tp_size={peer_info.decode_tp_size})"
             )
+        if state_type == "minimax_index_k":
+            if self.pp_size is not None and self.pp_size > 1:
+                raise RuntimeError(
+                    "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                )
+            if peer_info.decode_tp_size != self.attn_tp_size:
+                raise RuntimeError(
+                    "PD disagg: heterogeneous TP not supported for MiniMax sparse index yet."
+                )
 
         common_len = min(src_state_indices.size, dst_state_indices.size)
+        if (
+            state_type == "c128_state"
+            and common_len == 0
+            and src_state_indices.size == 0
+            and dst_state_indices.size == 0
+        ):
+            return []
         if common_len == 0 and max(src_state_indices.size, dst_state_indices.size) > 0:
             raise RuntimeError(
                 f"No overlapping state indices for state_type={state_type}"
             )
         if src_state_indices.size != dst_state_indices.size:
+            # These components are position- or request-indexed: truncating
+            # silently misaligns rows and corrupts KV. Paged swa/dsa tolerate
+            # a 1-page drift -> keep truncation.
+            if state_type in ("swa_ring", "c128_state"):
+                raise RuntimeError(
+                    f"{state_type.upper()} state index length mismatch: "
+                    f"src={src_state_indices.size}, dst={dst_state_indices.size}"
+                )
             logger.warning(
                 "State index length mismatch for %s: src=%d dst=%d; truncating to common prefix=%d",
                 state_type,
